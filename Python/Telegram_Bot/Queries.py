@@ -4,12 +4,20 @@ from datetime import datetime
 import Billing.Processes.Server_Connections as sc
 
 def user_time_validation(user_id):
-    if user_id in [1234567890, 1234567890, 1234567890, 1234567890, 1234567890, 1234567890, 1234567890, 1234567890, 1234567890]:
-        start_time = datetime.strptime('08:05:00', '%H:%M:%S').time()
+    # Kislay - 5625198558
+    # Ali - 5924571377
+    # Sunil - 6760913459
+    # Ramu - 1146352987
+    # Vishal - 1509400144
+    # Deepak - 8059495402
+    # Pankaj - 8294317420
+    # Sandeep - 8585260715
+    if user_id in [5625198558, 5924571377, 6760913459, 1146352987, 1509400144, 8059495402, 8294317420, 8585260715]:
+        start_time = datetime.strptime('08:00:00', '%H:%M:%S').time()
         end_time = datetime.strptime('08:40:00', '%H:%M:%S').time()
         current_time = datetime.now().time()
         if start_time <= current_time <= end_time:
-            return False, 'Bot can\'t be used from 8:05 AM to 8:40 AM.'
+            return False, 'Bot can\'t be used from 8:00 AM to 8:40 AM.'
         else:
             return True, 'Success.'
     else:
@@ -52,10 +60,6 @@ Example - /analysis 2023-09-15 2023-09-30 Yes
 Description - Get RTNM Amount.
 Example - /rtnm 2023-09-15 2023-09-30
 
-<b>/kpi_govind</b> [start date] [end date]
-Description - Send Govind's KPI report.
-Example - /kpi_govind 2023-09-15 2023-09-30
-
 <b>/nrf</b> [cases]
 Description - Send No Record Found cases.
 Example - /nrf 20231090233664,
@@ -81,10 +85,6 @@ Example - /uad 2023-09-16 2023-09-17
 <b>/missing</b> [start date] [end date]
 Description - Get Pending Cases to be freezed.
 Example - /missing 2023-09-16 2023-09-17
-
-<b>/kmd</b> [start date] [end date]
-Description - Delete CPED KMs Activity cases.
-Example - /kmd 2023-09-16 2023-09-17
 '''
 
 def date_order(start_date, end_date):
@@ -119,6 +119,7 @@ def online():
         df = pd.read_sql('SELECT COUNT(*) FROM ' + table, con=create_engine(sc.connection(server)))
         if df.loc[0].values[0] >= 0:
             return 'Online : ' + str(server)
+        return ''
 
     def offline(server):
         return 'OFFLINE : ' + str(server)
