@@ -4,20 +4,12 @@ from datetime import datetime
 import Billing.Processes.Server_Connections as sc
 
 def user_time_validation(user_id):
-    # Kislay - 5625198558
-    # Ali - 5924571377
-    # Sunil - 6760913459
-    # Ramu - 1146352987
-    # Vishal - 1509400144
-    # Deepak - 8059495402
-    # Pankaj - 8294317420
-    # Sandeep - 8585260715
-    if user_id in [5625198558, 5924571377, 6760913459, 1146352987, 1509400144, 8059495402, 8294317420, 8585260715]:
-        start_time = datetime.strptime('08:00:00', '%H:%M:%S').time()
-        end_time = datetime.strptime('08:40:00', '%H:%M:%S').time()
+    if user_id in [123456789, 123456789, 123456789]:
+        start_time = datetime.strptime('08:40:00', '%H:%M:%S').time()
+        end_time = datetime.strptime('09:30:00', '%H:%M:%S').time()
         current_time = datetime.now().time()
         if start_time <= current_time <= end_time:
-            return False, 'Bot can\'t be used from 8:00 AM to 8:40 AM.'
+            return False, 'Bot can\'t be used from 8:40 AM to 9:30 AM.'
         else:
             return True, 'Success.'
     else:
@@ -30,12 +22,18 @@ def help_commands():
 Description - Migrate billing data.
 Example - /migrate 2023-09-15 2023-09-30 20
 
-<b>/freeze</b> [start date] [end date] [last modified date] [scope(optional,default 0)]
+<b>/analysis</b> [start date] [end date] [send email(optional, default='no')]
+Description - Send billing data analysis.
+Example - /analysis 2023-09-15 2023-09-30 Yes
+
+<b>/migana</b> [date]
+Description - Migration and analysis of billing data
+Example - /migana 2026-06-15
+
+<b>/freeze</b> [start date] [end date(optional)] [last modified time] [scope]
 Description - Freeze billing data.
-    scope = 0(IT IS,RTNM Desk,ERC), 
-                   1(IT IS,RTNM Desk), 2(IT IS)
-Example - /freeze 2023-09-15 2023-09-20 
-        2023-09-21 11:30:00 1
+scope = 0(IT IS,RTNM Desk,ERC), 1(IT IS,RTNM Desk), 2(IT IS)
+Example - /freeze 2023-09-15 2023-09-20 13:20 1
 
 <b>/unfreeze</b> [reason] [cases]
 Description - Unfreeze billing data.
@@ -45,46 +43,50 @@ Example - /unfreeze Correction
             20231090234706
 
 <b>/online</b>
-Description - Get Online Status of Server.
+Description - Get online status of servers.
 Example - /online
 
 <b>/sync</b>
-Description - Get Last Sync Time of data in 202 Server.
+Description - Get Last Sync Time of data in 202 server.
 Example - /sync
 
-<b>/analysis</b> [start date] [end date] [send email]
-Description - Send Billing Data Analysis.
-Example - /analysis 2023-09-15 2023-09-30 Yes
-
-<b>/rtnm</b> [start date] [end date]
-Description - Get RTNM Amount.
+<b>/rtnm</b> [start date] [end date(optional)]
+Description - Get RTNM amount.
 Example - /rtnm 2023-09-15 2023-09-30
 
 <b>/nrf</b> [cases]
-Description - Send No Record Found cases.
+Description - Send No Record Found cases to Achala for unlock.
 Example - /nrf 20231090233664,
             20231090234706,
             20231090234706
 
 <b>/kma</b> [nrf email]
-Description - Unlock KMs Activity Cases.
+Description - Unlock KMs activity cases.
 Example - /kma yes
 
 <b>/scheduler</b>
 Description - Run Scheduler manually.
 Example - /scheduler
 
-<b>/pending</b> [start date] [end date] [unfreeze_nrf(optional)]
-Description - Send Pending Cases of CPED & RTNM Desk.
+<b>/pscheduler</b>
+Description - Run Post Scheduler manually.
+Example - /pscheduler
+
+<b>/pending</b> [start date] [end date(optional)] [unfreeze_nrf(optional, default='yes')]
+Description - Send pending cases of CPED & RTNM desk.
 Example - /pending 2023-09-16 2023-09-17 no
 
-<b>/uad</b> [start date] [end date]
-Description - Get Pending UAD Cases.
+<b>/uad</b> [start date] [end date(optional)]
+Description - Get pending UAD cases.
 Example - /uad 2023-09-16 2023-09-17
 
-<b>/missing</b> [start date] [end date]
-Description - Get Pending Cases to be freezed.
-Example - /missing 2023-09-16 2023-09-17
+<b>/pf</b> [start date] [end date(optional)]
+Description - Get pending case count to be freezed.
+Example - /pf 2023-09-16 2023-09-17
+
+<b>/kmd</b>
+Description - Data Migration for KM Dashboard.
+Example - /kmd
 '''
 
 def date_order(start_date, end_date):
@@ -116,10 +118,16 @@ def validations(user_id, start_date, end_date):
 
 def online():
     def status(server, table):
-        df = pd.read_sql('SELECT COUNT(*) FROM ' + table, con=create_engine(sc.connection(server)))
-        if df.loc[0].values[0] >= 0:
-            return 'Online : ' + str(server)
-        return ''
+        con = None
+        try:
+            con = create_engine(sc.connection(server))
+            df = pd.read_sql('SELECT COUNT(*) FROM ' + table, con=con)
+            if df.loc[0].values[0] >= 0:
+                return 'Online : ' + str(server)
+            return ''
+        finally:
+            if con:
+                con.dispose()
 
     def offline(server):
         return 'OFFLINE : ' + str(server)
@@ -152,10 +160,22 @@ def online():
     return stat_71 + '\n' + stat_73 + '\n' + stat_202 + '\n' + stat_17 + '\n' + stat_16
 
 def sync():
-    east = pd.read_sql('SELECT MAX(t.creation_date) FROM CAD_UP_PROD.t_cad_incident t;', con=create_engine(sc.connection(202)))
-    west = pd.read_sql('SELECT MAX(t.creation_date) FROM CAD_UP_WEST_PROD.t_cad_incident t;', con=create_engine(sc.connection(202)))
-    return 'East : ' + str(east.iat[0, 0]) + '\n' + 'West : ' + str(west.iat[0, 0])
+    con = None
+    try:
+        con = create_engine(sc.connection(202))
+        east = pd.read_sql('SELECT MAX(t.creation_date) FROM CAD_UP_PROD.t_cad_incident t;', con=con)
+        west = pd.read_sql('SELECT MAX(t.creation_date) FROM CAD_UP_WEST_PROD.t_cad_incident t;', con=con)
+        return 'East : ' + str(east.iat[0, 0]) + '\n' + 'West : ' + str(west.iat[0, 0])
+    finally:
+        if con:
+            con.dispose()
 
 def rtnm(start_date, end_date):
-    query = 'select * from rtnm(\'' + start_date + '\', \'' + end_date + '\') order by [Date];'
-    return pd.read_sql(query, con=create_engine(sc.connection(16))).to_string(index=False, header=False)
+    con = None
+    try:
+        con = create_engine(sc.connection(16))
+        query = 'select * from rtnm(\'' + start_date + '\', \'' + end_date + '\') order by [Date];'
+        return pd.read_sql(query, con=con).to_string(index=False, header=False)
+    finally:
+        if con:
+            con.dispose()

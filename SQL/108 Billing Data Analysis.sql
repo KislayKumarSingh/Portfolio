@@ -1,12 +1,24 @@
 -- 108 Billing Data Analysis SQL Server Stored Procedures & Functions
 /********************************************************************/
 
+-- VIP Overlapping Cases
+select a.vehicle_number,a.id as 'Overlapping ID',a.[Start_Date] as 'OG_Start_Date',a.[End_Date] as 'OG_End_Date',
+b.id as 'Overlapped ID',b.[Start_Date] as 'OD_Start_Date',b.[End_Date] as 'OD_End_Date'
+from [Billing108].[dbo].[vip_duties] a
+join [Billing108].[dbo].[vip_duties] b
+on a.vehicle_number=b.vehicle_number
+where a.id < b.id
+and a.[Start_Date] <= b.End_Date
+and a.End_Date >= b.[Start_Date]
+order by a.vehicle_number,a.[Start_Date];
+GO
+
 -- RTNM Amount
 alter function rtnm(@start_date date, @end_date date)
 returns table as return
 	select CONVERT(date,ambulance_assignment_time) as 'Date', SUM(DelayResponsetimeMinute)*60 as 'Amount'
 	from [Billing108].[dbo].[cad_raw_data]
-	where ambulance_assignment_time between CONCAT(@start_date,' 00:00:00') and CONCAT(@end_date,' 23:59:59')
+	where ambulance_assignment_time between CONCAT(@start_date,' 00:00:00') AND CONCAT(@end_date,' 23:59:59')
 	and DelayResponsetimeMinute>0
 	group by CONVERT(date,ambulance_assignment_time);	
 GO
@@ -15,48 +27,37 @@ GO
 alter function contact_number()
 returns table as return
 (
-	with cte as
+	WITH DistrictFirstOccurrence AS
 	(
-		select *
-		from
-		(
-			SELECT 'Benef. Contact No. in more than 2 Districts' as 'Observation',Cluster,
-			incident_id,ambulance_assignment_time,beneficary_contact_number,benficiary_district,
-			is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time,
-			ROW_NUMBER() over (partition by beneficary_contact_number order by ambulance_assignment_time) as 'Contact_Order',
-			ROW_NUMBER() over (partition by beneficary_contact_number,benficiary_district order by ambulance_assignment_time) as 'Contact_District_Order'
-			FROM [Billing108].[dbo].[cad_raw_data]
-			WHERE beneficary_contact_number IN
-			(
-				SELECT beneficary_contact_number
-				FROM [Billing108].[dbo].[cad_raw_data]
-				where beneficary_contact_number <> '' and benficiary_district <> ''
-				GROUP BY beneficary_contact_number HAVING COUNT(DISTINCT benficiary_district)>2
-			)
-		) al
-		where Contact_District_Order=1
-	)
-	select *
-	from cte
-	where incident_id in
+		SELECT beneficary_contact_number, benficiary_district, MIN(ambulance_assignment_time) AS FirstSeen
+		FROM [Billing108].[dbo].[cad_raw_data]
+		WHERE ambulance_assignment_time between '2026-08-01 00:00:00' AND '2026-08-31 23:59:59'
+		and beneficary_contact_number <> ''
+		AND benficiary_district <> ''
+		GROUP BY beneficary_contact_number, benficiary_district
+	), 
+	RankedDistricts AS
 	(
-		select incident_id
-		from 
-		(
-			select incident_id,beneficary_contact_number,Contact_Order,
-			MAX(Contact_Order) over (partition by beneficary_contact_number) as 'Max_Contact_Order'
-			from cte
-		) alias
-		where Contact_Order=Max_Contact_Order
+		SELECT beneficary_contact_number, benficiary_district, 
+		ROW_NUMBER() OVER(PARTITION BY beneficary_contact_number ORDER BY FirstSeen) AS DistrictRank
+		FROM DistrictFirstOccurrence
 	)
+	SELECT 'Benef. Contact No. in more than 2 Districts' as Observation, crd.Cluster,
+	crd.incident_id,crd.ambulance_assignment_time,crd.beneficary_contact_number,crd.benficiary_district,
+	crd.is_mci,crd.[Source of Distance],crd.case_type_name,crd.map_distance,crd.update_from,crd.Level1_end_call_time
+	FROM [Billing108].[dbo].[cad_raw_data] crd
+	INNER JOIN RankedDistricts rd 
+	ON rd.beneficary_contact_number = crd.beneficary_contact_number AND rd.benficiary_district = crd.benficiary_district
+	WHERE crd.ambulance_assignment_time between '2026-08-01 00:00:00' AND '2026-08-31 23:59:59'
+	and rd.DistrictRank > 2
 );
 GO
 
 select * from contact_number();
 GO
 
--- Exceptional Cases
-alter function exceptional_cases(@start_date_time as datetime2, @end_date_time as datetime2)
+-- Exceptional Cases (CPED Standard Remarks)
+alter function exceptional_cases(@start_date_time as datetime, @end_date_time as datetime)
 returns table as return
 	select distinct [Incident Id],Observation,[Standard Remarks]
 	from
@@ -82,6 +83,7 @@ returns table as return
 	and a.[Ambulance Assignment Time] between CONCAT(@start_date,' 00:00:00') AND CONCAT(@end_date,' 23:59:59')
 	and 
 	(
+		-- (Scopes - 'IT IS,RTNM Desk,ERC')
 		a.Scope in (SELECT value FROM STRING_SPLIT(@scope, ','))
 		or
 		(
@@ -91,77 +93,140 @@ returns table as return
 				a.[Standard Remarks] is null 
 				or (a.[Standard Remarks]='ok as per Manual' and crd.[Source of Distance]='Gps')
 				or (a.[Standard Remarks]='ok as per GPS' and crd.[Source of Distance]='Manual')
+				-- 'Escalated Case (Case Overlap)' & 'UAD Case' are UAD Cases (automatic process in Billing_Data_Analysis.py)
+				-- 'Case Done Within VIP Duty' is VIP Overlapping Case, resolved by Vishesh & will be available in 'VIP Duty Overlap' sheet of Analysis file
+				-- Rest of the remarks are acceptable except 'ok as per GPS' & 'ok as per Manual' which are handled in the above two OR conditions
 				or a.[Standard Remarks] not in('Escalated Case (Case Overlap)','Case Done Within VIP Duty','As per EMT Vehicle was on road during assignment',
-												'ok as per ERC update','ok as per Exception','ok as per GPS','ok as per Manual','ok as per RTNM Desk',
-												'Short Distance Case','Short Duration Case','UAD case','Wrong EM Type','Off road before hospital reach')
+												'ok(ERC Reattempt post Analysis-Non Critical anomaly)','ok as per Exception','ok as per GPS','ok as per Manual',
+												'ok as per RTNM Desk','Short Distance Case','Short Duration Case','UAD case','Wrong EM Type','Off road before hospital reach')
 				or (a.Observation in(select Observation from [Billing108].[dbo].[Billing Process Queries List] where is_critical='Yes' and Scope='IT IS / CPED'))
 			)
 		)
 	);
 GO
 
-alter procedure gps_manual_summary(@start_date as date, @end_date as date) as
-begin
+-- GPS Manual Summary
+ALTER PROCEDURE gps_manual_summary(@start_date DATE, @end_date DATE) AS
+BEGIN
+    
+    SET NOCOUNT ON;
 
-DECLARE @columns nvarchar(MAX)='', @manual_sql nvarchar(MAX)=''
+    SELECT
+        vehicle_number,
+        DAY(ambulance_assignment_time) AS ReportDay,
+        [Source of Distance]
+    INTO #BaseData
+    FROM Billing108.dbo.cad_raw_data
+    WHERE ambulance_assignment_time BETWEEN CONCAT(@start_date,' 00:00:00') AND CONCAT(@end_date,' 23:59:59');
 
-SELECT @columns+=QUOTENAME([Day]) + ','
-from
-(
-	select distinct DAY(ambulance_assignment_time) as 'Day'
-	FROM [Billing108].[dbo].[cad_raw_data]
-	where ambulance_assignment_time between CONCAT(@start_date,' 00:00:00') AND CONCAT(@end_date,' 23:59:59')
-) cols
-ORDER BY [Day];
+    DECLARE @columns NVARCHAR(MAX);
+    DECLARE @select_columns NVARCHAR(MAX);
+    DECLARE @sql NVARCHAR(MAX);
 
-SET @columns = LEFT(@columns, LEN(@columns) - 1);
+    SELECT
+        @columns =
+			STRING_AGG(QUOTENAME(ReportDay), ',')
+            WITHIN GROUP (ORDER BY ReportDay),
 
-SET @manual_sql =concat('
-	select *
-	into ##Manual_Temp
-	from
-	(
-		select vehicle_number as [Vehicle],DAY(ambulance_assignment_time) as [Day],count(*) as [Manual]
-		from [Billing108].[dbo].[cad_raw_data]
-		where ambulance_assignment_time between ''' , @start_date , ' 00:00:00'' and ''' , @end_date , ' 23:59:59''
-		and [Source of Distance]=''Manual''
-		group by vehicle_number,DAY(ambulance_assignment_time)
-	) manual_gps
-	pivot
-	(
-		sum([Manual])
-		for [Day] in (', @columns, ')
-	) pivot_table;'
-);
+        @select_columns =
+            STRING_AGG('MP.' + QUOTENAME(ReportDay), ',')
+            WITHIN GROUP (ORDER BY ReportDay)
+    FROM
+    (
+        SELECT DISTINCT ReportDay
+        FROM #BaseData
+    ) D;
 
-drop table if exists ##Manual_Temp;
+    SET @sql = '
+        WITH VehicleSummary AS
+        (
+            SELECT
+                vehicle_number,
+                COUNT(*) AS Total,
+                SUM(CASE
+                        WHEN [Source of Distance] = ''Manual''
+                        THEN 1
+                        ELSE 0
+                    END) AS Manual
+            FROM #BaseData
+            GROUP BY vehicle_number
+        ),
+        ManualPivot AS
+        (
+            SELECT *
+            FROM
+            (
+                SELECT
+                    vehicle_number,
+                    ReportDay,
+                    COUNT(*) AS ManualCount
+                FROM #BaseData
+                WHERE [Source of Distance] = ''Manual''
+                GROUP BY vehicle_number, ReportDay
+            ) M
+            PIVOT
+            (
+                SUM(ManualCount)
+                FOR ReportDay IN (' + @columns + ')
+            ) P
+        )
+        SELECT
+            VS.vehicle_number AS [Vehicle],
+            VS.Total,
+            VS.Total - VS.Manual AS GPS,
+            VS.Manual,
+            ROUND(VS.Manual * 100.0 / NULLIF(VS.Total,0),2) AS [Manual %],
+            ' + @select_columns + '
+        FROM VehicleSummary VS
+        LEFT JOIN ManualPivot MP ON VS.vehicle_number = MP.vehicle_number
+        WHERE (VS.Manual * 100.0) / NULLIF(VS.Total,0) >= 5
+        ORDER BY [Manual %] DESC;
+    ';
 
-EXECUTE sp_executesql @manual_sql;
+    EXEC sp_executesql @sql;
 
-select mg.Vehicle,mg.[Total],mg.[Total]-mg.[Manual] as 'GPS',mg.[Manual],(mg.[Manual]*100)/mg.[Total] as 'Manual %',mt.*
-from 
-(
-	select vehicle_number as 'Vehicle',count(*) as 'Total',
-	SUM(IIF([Source of Distance]='Manual',1,0)) as 'Manual'
-	from [Billing108].[dbo].[cad_raw_data]
-	group by vehicle_number
-) mg
-left join ##Manual_Temp mt on mg.Vehicle=mt.Vehicle
-where ([Manual]*100)/[Total] >= 5
-order by [Manual %] desc;
-
-end;
+END;
 GO
 
+exec gps_manual_summary '2026-07-01','2026-07-31';
+
+-- Manual Cases Analysis
+WITH VehicleStats AS
+(
+    SELECT vehicle_number
+    FROM [Billing108].[dbo].[cad_raw_data]
+	-- below date should always be month start & end date to caluclate % of manual cases
+    WHERE ambulance_assignment_time between '2026-07-01 00:00:00' AND '2026-07-31 23:59:59'
+    GROUP BY vehicle_number
+    HAVING SUM(CASE WHEN [Source of Distance] = 'Manual' THEN 1 ELSE 0 END) * 100.0 / COUNT(*) >= 5
+)
+SELECT crd.incident_id, crd.ambulance_assignment_time, crd.vehicle_number, mpd.Insert_Timestamp AS [CPED Manual Data Insert]
+FROM [Billing108].[dbo].[cad_raw_data] crd
+INNER JOIN VehicleStats vs ON crd.vehicle_number = vs.vehicle_number
+LEFT JOIN [172.16.108.188].[CPED_Master].[dbo].[Manual_PCR_Data] mpd ON crd.incident_id = mpd.[Incident Id]
+WHERE crd.ambulance_assignment_time between '2026-07-01 00:00:00' AND '2026-07-31 23:59:59'
+AND crd.[Source of Distance] = 'Manual'
+--AND mpd.[Incident Id] IS not NULL
+ORDER BY crd.ambulance_assignment_time;
+
+-- Average Trip KMs per Ambulance per Day
+select round((sum(Total_gps_trip_kms)/2200.0/30),2) as 'Avg Trip KMs per Amby per Day' 
+from [Billing108].[dbo].[cad_raw_data]
+where ambulance_assignment_time between '2026-01-01 00:00:00' AND '2026-01-30 23:59:59';
+
 -- Execute Billing Data Analysis
-exec Billing_Data_Analysis '2025-04-01','2025-04-14','Manual';
-exec Billing_Data_Analysis '2025-03-29','2025-03-29','Manual','crd_km';
+exec Billing_Data_Analysis '2026-07-26','2026-07-26','Manual';
+exec Billing_Data_Analysis '2026-01-28','2026-01-29','Manual','crd_km';
 GO
 
 -- Billing Data Analysis
 alter procedure Billing_Data_Analysis(@start_date as date, @end_date as date, @process_type as varchar(9), @table_name as varchar(100)='cad_raw_data') as
 begin
 SET NOCOUNT ON;
+
+declare @start_date_time as datetime = CONCAT(@start_date,' 00:00:00');
+declare @end_date_time as datetime = CONCAT(@end_date,' 23:59:59');
+declare @DV_end_date as datetime = DATEADD(day,1,@end_date_time);
 
 declare @query as varchar(max);
 
@@ -176,19 +241,13 @@ set @query = '
 ';
 Exec (@query);
 
--- Declaring & Assigning Date Variation's Start & End Date
-declare @DV_start_date as date,@DV_end_date as date;
-set @DV_start_date=DATEADD(day,-1,@start_date);
-set @DV_end_date=DATEADD(day,1,@end_date);
-
 -- Temporary Table Creation
 drop table if exists #temp_table;
 
-select top 1 * 
+select * 
 into #temp_table
-from [Billing108].[dbo].[cad_raw_data];
-
-truncate table #temp_table;
+from [Billing108].[dbo].[cad_raw_data]
+where 1=0;
 
 set @query = concat('
 	insert into #temp_table
@@ -196,6 +255,7 @@ set @query = concat('
 	from [Billing108].[dbo].' , QUOTENAME(@table_name) , '
 	where ambulance_assignment_time between ''' , @start_date , ' 00:00:00'' and ''' , @end_date , ' 23:59:59'';
 ');
+
 Exec (@query);
 
 -- Report Table Creation
@@ -203,8 +263,8 @@ drop table if exists #report_table;
 
 create table #report_table
 (
-	Observation varchar(200), "Incident ID" bigint, "Ambulance Assignment Time" datetime2, "Cluster Name" varchar(5), "is mci" bit,
-	"Source of Distance" varchar(10), "Case Type" varchar(15), "Map Distance" float, "Update From" varchar(30), "Call End" datetime2
+	Observation varchar(200), "Incident ID" bigint, "Ambulance Assignment Time" datetime, "Cluster Name" varchar(5), "is mci" TINYINT,
+	"Source of Distance" varchar(10), "Case Type" varchar(15), "Map Distance" float, "Update From" varchar(30), "Call End" datetime
 );
 
 -- 1-B2S GPS Null
@@ -228,68 +288,68 @@ SELECT 'H2B GPS Null',incident_id,ambulance_assignment_time,Cluster,is_mci,
 FROM #temp_table
 WHERE hsptl_to_base_gps_km IS NULL;
 
--- 4-Call Start Null or 01-01-1900
+-- 4-Call Start Null
 insert into #report_table 
-SELECT 'Call Start Null or 01-01-1900',incident_id,ambulance_assignment_time,
+SELECT 'Call Start Null',incident_id,ambulance_assignment_time,
 Cluster,is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-WHERE creation_date IS NULL OR CONVERT(date,creation_date)='1900-01-01';
+WHERE creation_date IS NULL;
 
--- 5-Call End Null or 01-01-1900
+-- 5-Call End Null
 insert into #report_table 
-SELECT 'Call End Null or 01-01-1900',incident_id,ambulance_assignment_time,
+SELECT 'Call End Null',incident_id,ambulance_assignment_time,
 Cluster,is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-WHERE Level1_end_call_time IS NULL OR CONVERT(date,Level1_end_call_time)='1900-01-01';
+WHERE Level1_end_call_time IS NULL;
 
--- 6-Assignment Null or 01-01-1900
+-- 6-Assignment Null
 insert into #report_table 
-SELECT 'Assignment Null or 01-01-1900',incident_id,ambulance_assignment_time,
+SELECT 'Assignment Null',incident_id,ambulance_assignment_time,
 Cluster,is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-WHERE ambulance_assignment_time IS NULL OR CONVERT(date,ambulance_assignment_time)='1900-01-01';
+WHERE ambulance_assignment_time IS NULL;
 
--- 7-Departure Null or 01-01-1900
+-- 7-Departure Null
 insert into #report_table 
-SELECT 'Departure Null or 01-01-1900',incident_id,ambulance_assignment_time,
+SELECT 'Departure Null',incident_id,ambulance_assignment_time,
 Cluster,is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-WHERE Ambulance_base_start_time IS NULL OR CONVERT(date,Ambulance_base_start_time)='1900-01-01';
+WHERE Ambulance_base_start_time IS NULL;
 
--- 8-Pickup reach Null or 01-01-1900
+-- 8-Pickup reach Null
 insert into #report_table 
-SELECT 'Pickup reach Null or 01-01-1900',incident_id,ambulance_assignment_time,
+SELECT 'Pickup reach Null',incident_id,ambulance_assignment_time,
 Cluster,is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-WHERE Ambulance_pickup_point_reach_time IS NULL OR CONVERT(date,Ambulance_pickup_point_reach_time)='1900-01-01';
+WHERE Ambulance_pickup_point_reach_time IS NULL;
  
--- 9-Pickup depart Null or 01-01-1900
+-- 9-Pickup depart Null
 insert into #report_table 
-SELECT 'Pickup depart Null or 01-01-1900',incident_id,ambulance_assignment_time,
+SELECT 'Pickup depart Null',incident_id,ambulance_assignment_time,
 Cluster,is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-WHERE Ambulance_pickup_point_departure_time IS NULL OR CONVERT(date,Ambulance_pickup_point_departure_time)='1900-01-01';
+WHERE Ambulance_pickup_point_departure_time IS NULL;
 
--- 10-Destination reach Null or 01-01-1900
+-- 10-Destination reach Null
 insert into #report_table 
-SELECT 'Destination reach Null or 01-01-1900',incident_id,ambulance_assignment_time,
+SELECT 'Destination reach Null',incident_id,ambulance_assignment_time,
 Cluster,is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-WHERE Ambulance_destination_reach_time IS NULL OR CONVERT(date,Ambulance_destination_reach_time)='1900-01-01';
+WHERE Ambulance_destination_reach_time IS NULL;
 
--- 11-Destination depart Null or 01-01-1900
+-- 11-Destination depart Null
 insert into #report_table 
-SELECT 'Destination depart Null or 01-01-1900',incident_id,ambulance_assignment_time,
+SELECT 'Destination depart Null',incident_id,ambulance_assignment_time,
 Cluster,is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-WHERE Ambulance_destination_depart_time IS NULL OR CONVERT(date,Ambulance_destination_depart_time)='1900-01-01';
+WHERE Ambulance_destination_depart_time IS NULL;
 
--- 12-Base reach Null or 01-01-1900
+-- 12-Base reach Null
 insert into #report_table 
-SELECT 'Base reach Null or 01-01-1900',incident_id,ambulance_assignment_time,
+SELECT 'Base reach Null',incident_id,ambulance_assignment_time,
 Cluster,is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-WHERE Ambulance_base_reach_time IS NULL OR CONVERT(date,Ambulance_base_reach_time)='1900-01-01';
+WHERE Ambulance_base_reach_time IS NULL;
 
 -- 13-Call Start > Call end
 insert into #report_table 
@@ -489,7 +549,7 @@ insert into #report_table
 SELECT 'Destination Hospital is null',incident_id,ambulance_assignment_time,
 Cluster,is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-WHERE Destination_hospital IS NULL;
+WHERE Destination_hospital IS NULL or TRIM(Destination_hospital)='';
 
 -- 45-B2S > 0 KM but travel time = 0
 insert into #report_table 
@@ -539,13 +599,13 @@ insert into #report_table
 select 'Date variation in and after Assignment',incident_id,ambulance_assignment_time,
 Cluster,is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-where (convert(date,ambulance_assignment_time) not between @start_Date and @end_Date)
-or (convert(date,Ambulance_base_start_time) not between @start_Date and @DV_end_Date)
-or (convert(date,Ambulance_pickup_point_reach_time) not between @start_Date and @DV_end_Date)
-or (convert(date,Ambulance_pickup_point_departure_time) not between @start_Date and @DV_end_Date)
-or (convert(date,Ambulance_destination_reach_time) not between @start_Date and @DV_end_Date)
-or (convert(date,Ambulance_destination_depart_time) not between @start_Date and @DV_end_Date)
-or (convert(date,Ambulance_base_reach_time) not between @start_Date and @DV_end_Date);
+where ambulance_assignment_time not between @start_date_time and @end_date_time
+or Ambulance_base_start_time not between @start_date_time and @DV_end_Date
+or Ambulance_pickup_point_reach_time not between @start_date_time and @DV_end_Date
+or Ambulance_pickup_point_departure_time not between @start_date_time and @DV_end_Date
+or Ambulance_destination_reach_time not between @start_date_time and @DV_end_Date
+or Ambulance_destination_depart_time not between @start_date_time and @DV_end_Date
+or Ambulance_base_reach_time not between @start_date_time and @DV_end_Date;
 
 -- 56-Total KM Mismatch
 insert into #report_table 
@@ -559,14 +619,14 @@ insert into #report_table
 select 'GPS link missing in GPS trip',incident_id,ambulance_assignment_time,
 Cluster,is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-where Hyperlink_tab is null or Hyperlink_tab='NA' ;
+where Hyperlink_tab is null or LEN(TRIM(Hyperlink_tab)) < 90;
 
 -- 60-PCR not uploaded
 insert into #report_table 
 select 'PCR not uploaded',incident_id,ambulance_assignment_time,Cluster,
 is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-where pcr_upload is Null;
+where pcr_upload is Null or LEN(TRIM(pcr_upload)) < 30;
 
 -- 66-Negative KMs
 insert into #report_table
@@ -589,14 +649,6 @@ is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_c
 FROM #temp_table
 where scene_to_base_gps_km>0 or scene_to_base_gps_km<0;
 
--- 76-Date variation before Assignment
-insert into #report_table 
-select 'Date variation before Assignment',incident_id,ambulance_assignment_time,
-Cluster,is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
-FROM #temp_table
-where (convert(date,creation_date) not between @DV_start_date and @DV_end_Date)
-or (convert(date,Level1_end_call_time) not between @DV_start_date and @DV_end_Date);
-
 -- 78-RTNM > 0 Min
 insert into #report_table
 select 'RTNM > 0 Min',incident_id,ambulance_assignment_time,Cluster,
@@ -609,14 +661,15 @@ insert into #report_table
 SELECT 'Call Reference ID Null',incident_id,ambulance_assignment_time,Cluster,
 is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-where callreferenceid is null;
+where callreferenceid is null or LEN(TRIM(callreferenceid))<>20;
 
 -- 85-Improper District Name
 insert into #report_table
 select 'Improper District Name',incident_id,ambulance_assignment_time,Cluster,
 is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 from #temp_table
-where vehicle_base_district not in
+where vehicle_base_district is null
+or vehicle_base_district not in
 (
 	'Agra','Aligarh','Ambedkar Nagar','Amethi','Amroha','Auraiya','Ayodhya','Azamgarh','Baghpat','Bahraich','Ballia',
 	'Balrampur','Banda','Barabanki','Bareilly','Basti','Bhadohi','Bijnor','Budaun','Bulandshahr','Chandauli','Chitrakoot',
@@ -662,21 +715,21 @@ insert into #report_table
 SELECT 'Response time Null',incident_id,ambulance_assignment_time,Cluster,
 is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-where [Response time] is null;
+where [Response time] is null or LEN([Response time]) not between 8 and 9;
 
 -- 90-Delay in Response time Null
 insert into #report_table
 SELECT 'Delay in Response time Null',incident_id,ambulance_assignment_time,Cluster,
 is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-where [Delay in Response time] is null;
+where [Delay in Response time] is null or TRIM([Delay in Response time])='';
 
 -- 91-DelayResponsetimeMinute Null
 insert into #report_table
 SELECT 'DelayResponsetimeMinute Null',incident_id,ambulance_assignment_time,Cluster,
 is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-where DelayResponsetimeMinute is null;
+where DelayResponsetimeMinute is null or DelayResponsetimeMinute < 0;
 
 -- 92-Call Duration < 40 seconds
 insert into #report_table
@@ -690,7 +743,8 @@ insert into #report_table
 SELECT 'Improper Beneficiary Contact Number',incident_id,ambulance_assignment_time,Cluster,
 is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-where LEN(CONVERT(bigint,beneficary_contact_number)) not in (1,10) or beneficary_contact_number is null or beneficary_contact_number='0000000000';
+where LEN(CONVERT(bigint,beneficary_contact_number)) not in (1,10) or beneficary_contact_number is null 
+or (TRIM(beneficary_contact_number) <> '' AND TRIM(beneficary_contact_number) NOT LIKE '%[^0]%');
 
 -- 94-Improper Caller Number
 insert into #report_table
@@ -726,9 +780,9 @@ and (Age is null or Age not in(
 '3 DAYS','3 MONTHS','3 YEARS','30 DAYS','4 DAYS','4 MONTHS','4 YEARS','5 DAYS','5 MONTHS','5 YEARS','6 DAYS',
 '6 MONTHS','6 YEARS','7 DAYS','7 MONTHS','7 YEARS','8 DAYS','8 MONTHS','8 YEARS','9 DAYS','9 MONTHS','9 YEARS'));
 
--- 101-H2B < 1 KM
+-- 101-IFT H2B < 1 KM
 insert into #report_table
-SELECT 'H2B < 1 KM',incident_id,ambulance_assignment_time,Cluster,
+SELECT 'IFT H2B < 1 KM',incident_id,ambulance_assignment_time,Cluster,
 is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
 WHERE hsptl_to_base_gps_km < 1 and case_type_name = 'IFT';
@@ -831,14 +885,6 @@ is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_c
 FROM #temp_table
 where creation_date > ambulance_assignment_time;
 
--- 121-Call Start = Assignment
-insert into #report_table
-SELECT 'Call Start = Assignment',incident_id,ambulance_assignment_time,Cluster,
-is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
-FROM #temp_table
-where creation_date = ambulance_assignment_time
-and is_mci=0;
-
 -- 122-Total Case Duration <= 10 Min
 insert into #report_table
 SELECT 'Total Case Duration <= 10 Min',incident_id,ambulance_assignment_time,Cluster,
@@ -858,8 +904,8 @@ insert into #report_table
 SELECT 'Improper Beneficiary Name',incident_id,ambulance_assignment_time,Cluster,
 is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-where Beneficiary_name is null or Beneficiary_name like '%uad' or Beneficiary_name like '%snr%' or Beneficiary_name like '%s n r%' or
-Beneficiary_name like '%dead%' or Beneficiary_name like '%shift%' or Beneficiary_name like '%found%';
+where Beneficiary_name is null or TRIM(Beneficiary_name)='' or Beneficiary_name like '%uad' or Beneficiary_name like '%snr%' 
+or Beneficiary_name like '%s n r%' or Beneficiary_name like '%dead%' or Beneficiary_name like '%shift%' or Beneficiary_name like '%found%';
 
 -- 125-Total Trip KM >= 70
 insert into #report_table
@@ -881,7 +927,7 @@ insert into #report_table
 SELECT 'EMT Name Null',incident_id,ambulance_assignment_time,Cluster,
 is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-where emt_name is null or emt_name='' or emt_name not like '%[a-z]%';
+where emt_name is null or TRIM(emt_name)='' or emt_name not like '%[a-z]%';
 
 -- 128-Pickup Location = Destination Hospital(IFT)
 insert into #report_table
@@ -898,6 +944,8 @@ is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_c
 FROM #temp_table
 where hsptl_to_base_gps_km > ((base_to_scene_gps_km + scene_to_hsptl_gps_km)*1.3)
 and (Total_gps_trip_kms>25 or hsptl_to_base_gps_km>20);
+--where hsptl_to_base_gps_km > ((base_to_scene_gps_km + scene_to_hsptl_gps_km)*2.0)
+--and (Total_gps_trip_kms>25 or hsptl_to_base_gps_km>20);
 
 -- 130-IFT H2B KM < 80% of S2H KM
 insert into #report_table
@@ -907,12 +955,12 @@ FROM #temp_table
 where case_type_name = 'IFT'
 and hsptl_to_base_gps_km < scene_to_hsptl_gps_km*0.8;
 
--- 131-Missing Vehicle Number
+-- 131-Vehicle Number Issue
 insert into #report_table
-SELECT 'Missing Vehicle Number',incident_id,ambulance_assignment_time,Cluster,
+SELECT 'Vehicle Number Issue',incident_id,ambulance_assignment_time,Cluster,
 is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-where vehicle_number is null or TRIM(vehicle_number)='';
+where vehicle_number is null or DATALENGTH(vehicle_number)<>10;
 
 -- 132-Improper Gender
 insert into #report_table
@@ -922,19 +970,98 @@ FROM #temp_table
 where Gender is null or Gender not in ('FEMALE','MALE','TRANSGENDER');
 
 -- 133-IFT Total Trip KM <=2
+--insert into #report_table
+--SELECT 'IFT Total Trip KM <=2',incident_id,ambulance_assignment_time,Cluster,
+--is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
+--FROM #temp_table
+--where case_type_name='IFT' and Total_gps_trip_kms<=2;
+
+-- 134-MCI case call type <> Mass Causality
 insert into #report_table
-SELECT 'IFT Total Trip KM <=2',incident_id,ambulance_assignment_time,Cluster,
+SELECT 'MCI case call type <> Mass Causality',incident_id,ambulance_assignment_time,Cluster,
 is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
 FROM #temp_table
-where case_type_name='IFT' and Total_gps_trip_kms<=2;
+where is_mci=1 and Call_Type <> 'Mass Causality';
+
+-- 135-Improper Caller Name
+insert into #report_table
+SELECT 'Improper Caller Name',incident_id,ambulance_assignment_time,Cluster,
+is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
+FROM #temp_table
+where DATALENGTH(Name_of_the_caller) > 50;
+
+-- 136-Assignment - Creation < 30 seconds
+insert into #report_table
+SELECT 'Assignment - Creation < 30 seconds',incident_id,ambulance_assignment_time,Cluster,
+is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
+FROM #temp_table
+where DATEDIFF(SECOND,creation_date,ambulance_assignment_time) < 30;
+
+-- 137-Vehicle Base Location null
+insert into #report_table
+SELECT 'Vehicle Base Location null',incident_id,ambulance_assignment_time,Cluster,
+is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
+FROM #temp_table
+where Vehicle_base_location is null or TRIM(Vehicle_base_location)='';
+
+-- 138-H2B speed < 5 KM/h
+insert into #report_table
+SELECT 'H2B speed < 5 KM/h',incident_id,ambulance_assignment_time,Cluster,
+is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
+FROM #temp_table
+where Ambulance_destination_depart_time <> Ambulance_base_reach_time 
+and (hsptl_to_base_gps_km/(DATEDIFF(SECOND,Ambulance_destination_depart_time,Ambulance_base_reach_time)/3600.0)) < 5
+and DATEDIFF(SECOND,Ambulance_destination_depart_time,Ambulance_base_reach_time) > 1800;
+
+-- 139-Backup Vehicle Number Issue
+insert into #report_table
+SELECT 'Backup Vehicle Number Issue',incident_id,ambulance_assignment_time,Cluster,
+is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
+FROM #temp_table
+where DATALENGTH(backup_vehicle_number)<>10;
+
+-- 140-Caller Number is Employee Phone Number
+insert into #report_table
+SELECT 'Caller Number is Employee Phone Number',incident_id,ambulance_assignment_time,Cluster,
+is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
+FROM #temp_table
+where Phone_no_of_the_Caller in (select [Employee Phone Number] from [Billing108].[dbo].[Employee_Phone_Number]);
+
+-- 141-Missing Pickup Location
+insert into #report_table
+SELECT 'Missing Pickup Location',incident_id,ambulance_assignment_time,Cluster,
+is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
+FROM #temp_table
+where Pickup_Location is null or TRIM(Pickup_Location)='';
+
+-- 142-Vehicle District <> Hospital District (EM)
+insert into #report_table
+SELECT 'Vehicle District <> Hospital District (EM)',incident_id,ambulance_assignment_time,Cluster,
+is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
+FROM #temp_table
+where case_type_name = 'EMERGENCY' and vehicle_base_district <> Destination_district;
+
+-- 143-Improper Pilot Mobile Number
+insert into #report_table
+SELECT 'Improper Pilot Mobile Number',incident_id,ambulance_assignment_time,Cluster,
+is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
+FROM #temp_table
+where LEN(CONVERT(bigint,pilot_mobile_number)) not in (1,10) or pilot_mobile_number is null 
+or (TRIM(pilot_mobile_number) <> '' AND TRIM(pilot_mobile_number) NOT LIKE '%[^0]%');
+
+-- 30-Benef. Contact No. in more than 2 Districts
+insert into #report_table
+select Observation,incident_id,ambulance_assignment_time,Cluster,
+is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
+from contact_number();
 
 -- 42-Overlapping Case
 drop table if exists #OC_temp_table;
 
 create table #OC_temp_table
 (
-	"Overlapping ID" bigint, "Overlapping AT" datetime2, "Overlapping BRT" datetime2, update_from varchar(30), 
-	"Overlapped ID" bigint, "Overlapped AT" datetime2, "Overlapped BRT" datetime2
+	"Overlapping ID" bigint, "Overlapping AT" datetime, "Overlapping BRT" datetime, update_from varchar(30), 
+	"Overlapped ID" bigint, "Overlapped AT" datetime, "Overlapped BRT" datetime
 );
 
 set @query = '
@@ -944,9 +1071,10 @@ set @query = '
 	b.incident_id as ''Overlapped ID'',b.ambulance_assignment_time as ''Overlapped AT'',b.Ambulance_base_reach_time as ''Overlapped BRT''
 	from [Billing108].[dbo].' + QUOTENAME(@table_name) + ' a
 	join [Billing108].[dbo].' + QUOTENAME(@table_name) + ' b
-	on a.vehicle_number=b.vehicle_number
-	where a.incident_id<>b.incident_id
-	and DATEADD(second,1,b.ambulance_assignment_time) between a.ambulance_assignment_time and a.Ambulance_base_reach_time;
+	on a.vehicle_number = b.vehicle_number
+	where a.incident_id < b.incident_id
+	and a.ambulance_assignment_time < b.Ambulance_base_reach_time
+	and a.Ambulance_base_reach_time > b.ambulance_assignment_time;
 ';
 Exec (@query);
 
@@ -954,19 +1082,13 @@ insert into #report_table
 select 'Overlapping Case',[Overlapping ID],[Overlapping AT],null,null,null,null,null,update_from,null
 from #OC_temp_table;
 
--- 30-Benef. Contact No. in more than 2 Districts
-insert into #report_table
-select Observation,incident_id,ambulance_assignment_time,Cluster,
-is_mci,[Source of Distance],case_type_name,map_distance,update_from,Level1_end_call_time
-from contact_number();
-
 -- 62-VIP Overlapping Case
 drop table if exists #VOC_temp_table;
 
 create table #VOC_temp_table
 (
-	incident_id bigint, Cluster varchar(4),vehicle_number varchar(10),ambulance_assignment_time datetime2,Ambulance_base_reach_time datetime2,
-	update_from varchar(30),id int, "Start_Date" datetime2, "End_Date" datetime2
+	incident_id bigint, Cluster varchar(4),vehicle_number varchar(10),ambulance_assignment_time datetime,Ambulance_base_reach_time datetime,
+	update_from varchar(30),id int, "Start_Date" datetime, "End_Date" datetime
 );
 
 set @query = '
@@ -976,10 +1098,8 @@ set @query = '
 	from #temp_table crd
 	inner join [Billing108].[dbo].[vip_duties] vd
 	on crd.vehicle_number = vd.vehicle_number
-	where vd.[Start_Date] between crd.ambulance_assignment_time and crd.Ambulance_base_reach_time
-	or vd.[End_Date] between crd.ambulance_assignment_time and crd.Ambulance_base_reach_time
-	or crd.ambulance_assignment_time between vd.[Start_Date] and vd.[End_Date]
-	or crd.Ambulance_base_reach_time between vd.[Start_Date] and vd.[End_Date];
+	where crd.ambulance_assignment_time <= vd.[End_Date] 
+	and crd.Ambulance_base_reach_time >= vd.[Start_Date];
 ';
 Exec (@query);
 
@@ -992,21 +1112,20 @@ drop table if exists #VOCO_temp_table;
 
 create table #VOCO_temp_table
 (
-	incident_id bigint,vehicle_number varchar(10),ambulance_assignment_time datetime2,Ambulance_base_reach_time datetime2,
-	update_from varchar(30),off_road_time datetime2,on_road_time datetime2
+	incident_id bigint,vehicle_number varchar(10),ambulance_assignment_time datetime,Ambulance_base_reach_time datetime,
+	update_from varchar(30),off_road_time datetime,on_road_time datetime
 );
 
 set @query = '
 	insert into #VOCO_temp_table
-	SELECT crd.incident_id,crd.vehicle_number,crd.ambulance_assignment_time,crd.Ambulance_base_reach_time,crd.update_from,od.off_road_time,od.Custom_on_road_time
+	SELECT crd.incident_id,crd.vehicle_number,crd.ambulance_assignment_time,crd.Ambulance_base_reach_time,
+	crd.update_from,od.off_road_time,od.Custom_on_road_time
 	from #temp_table crd
 	inner join [Billing108].[dbo].[offroad] od
 	on crd.vehicle_number = od.vehicle_number
 	where crd.backup_vehicle_number is null
-	and (od.off_road_time between crd.ambulance_assignment_time and crd.Ambulance_base_reach_time
-	or od.Custom_on_road_time between crd.ambulance_assignment_time and crd.Ambulance_base_reach_time
-	or crd.ambulance_assignment_time between od.off_road_time and od.Custom_on_road_time
-	or crd.Ambulance_base_reach_time between od.off_road_time and od.Custom_on_road_time);
+	and crd.ambulance_assignment_time <= od.Custom_on_road_time 
+	and crd.Ambulance_base_reach_time >= od.off_road_time;
 ';
 Exec (@query);
 
@@ -1018,7 +1137,7 @@ from #VOCO_temp_table;
 drop table if exists #exceptional_cases;
 select * 
 into #exceptional_cases
-from [Billing108].[dbo].exceptional_cases(CONCAT(@start_date,' 00:00:00'), CONCAT(@end_date,' 23:59:59'));
+from [Billing108].[dbo].exceptional_cases(@start_date_time, @end_date_time);
 
 -- Insert Data from Temporary Report Table to [Billing108].[dbo].[cad_raw_data_anomaly] Table
 insert into [Billing108].[dbo].[cad_raw_data_anomaly]
@@ -1049,7 +1168,7 @@ begin
 	from #OC_temp_table oc
 	left join #exceptional_cases ec	
 	on ec.Observation='Overlapping Case' and oc.[Overlapping ID]=ec.[Incident Id]
-	where oc.[Overlapping AT] between CONCAT(@start_date,' 00:00:00') and CONCAT(@end_date,' 23:59:59')
+	where oc.[Overlapping AT] between @start_date_time and @end_date_time
 	order by [Overlapping AT];
 
 	-- Fetch Data from VIP Overlapping Table
@@ -1058,16 +1177,16 @@ begin
 	from #VOC_temp_table voc
 	left join #exceptional_cases ec
 	on ec.Observation='VIP Overlapping Case' and voc.incident_id=ec.[Incident Id]
-	where voc.ambulance_assignment_time between CONCAT(@start_date,' 00:00:00') and CONCAT(@end_date,' 23:59:59')
+	where voc.ambulance_assignment_time between @start_date_time and @end_date_time
 	order by voc.ambulance_assignment_time;
 
 	-- Fetch Data from Vehicle Offroad Case Overlap Table
 	select voco.incident_id,voco.vehicle_number,voco.ambulance_assignment_time,voco.Ambulance_base_reach_time,
-	ec.[Standard Remarks],voco.off_road_time,voco.on_road_time
+	voco.update_from,ec.[Standard Remarks],voco.off_road_time,voco.on_road_time
 	from #VOCO_temp_table voco
 	left join #exceptional_cases ec
 	on ec.Observation='Vehicle offroad case overlap' and voco.incident_id=ec.[Incident Id]
-	where voco.ambulance_assignment_time between CONCAT(@start_date,' 00:00:00') and CONCAT(@end_date,' 23:59:59')
+	where voco.ambulance_assignment_time between @start_date_time and @end_date_time
 	order by voco.ambulance_assignment_time;
 
 end;

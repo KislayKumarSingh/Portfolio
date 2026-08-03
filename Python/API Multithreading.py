@@ -1,50 +1,47 @@
-import pandas as pd
 import threading
-import Billing.Call_Data_Extraction.Extract_Details as ed
+import numpy as np
+import pandas as pd
+import Billing.Call_Data.Testing_Extraction.Extract_Details as ed
 
-filename = r'C:\Users\singh_kislay\Desktop\Call Details.xlsx'
+filename = r"C:\Users\singh_kislay\Desktop\Call Details.xlsx"
 no_of_threads = 50
 
-# region Code
 def api_export(api_url):
     return pd.DataFrame([ed.run_api(api_url)])
 
-def assign_server(cluster, df, thread_id, result_dfs, lock):
-    data_df = pd.DataFrame()
-    for i in range(df.shape[0]):
-        reference_no = df.loc[i, 'Av_CallHitReferenceNo']
-        call_start = df.loc[i, 'CallStartTime']
+def assign_server(cluster, df, thread_id, result_dfs):
+    dfs = []
+    for row in df.itertuples(index=False):
+        reference_no = row.Av_CallHitReferenceNo
+        call_start = row.CallStartTime
         source, live_db_log, uac, dial_112 = ed.api(cluster, call_start, reference_no)
-        if source != '':
-            live_db_log_df = api_export(live_db_log)
-            if live_db_log_df.shape[1] > 1:
-                data_df = pd.concat([data_df, live_db_log_df]).reset_index(drop=True)
-            else:
-                uac_df = api_export(uac)
-                if uac_df.shape[1] > 1:
-                    data_df = pd.concat([data_df, uac_df]).reset_index(drop=True)
-                else:
-                    dial_112_df = api_export(dial_112)
-                    if dial_112_df.shape[1] > 1:
-                        data_df = pd.concat([data_df, dial_112_df]).reset_index(drop=True)
-    lock.acquire()
-    try:
-        result_dfs[thread_id] = data_df
-    finally:
-        lock.release()
+        if not source:
+            continue
+        for api_url in (live_db_log, uac, dial_112):
+            api_df = api_export(api_url)
 
-for cluster in ['East', 'West']:
-    excel_df = pd.read_excel(filename, sheet_name=cluster, usecols='C, F')
-    range_step = excel_df.shape[0] / no_of_threads
-    result_dfs = [None] * no_of_threads
+            if api_df.shape[1] > 1:
+                dfs.append(api_df)
+                break
+    if dfs:
+        result_dfs[thread_id] = pd.concat(dfs, ignore_index=True)
+    else:
+        result_dfs[thread_id] = pd.DataFrame()
+
+for cluster in ["East", "West"]:
+    excel_df = pd.read_excel(filename, sheet_name=cluster, usecols="C,F")
+    chunks = np.array_split(excel_df, no_of_threads)
+    result_dfs = [None] * len(chunks)
     threads = []
-    for i in range(no_of_threads):
-        extract_df = excel_df.iloc[int(i * range_step):int((i + 1) * range_step)].reset_index(drop=True)
-        thread = threading.Thread(target=assign_server, args=(cluster, extract_df, i, result_dfs, threading.Lock(),))
+
+    for thread_id, chunk in enumerate(chunks):
+        chunk = chunk.reset_index(drop=True)
+        thread = threading.Thread(target=assign_server, args=(cluster, chunk, thread_id, result_dfs))
         threads.append(thread)
         thread.start()
+
     for thread in threads:
         thread.join()
-    merged_df = pd.concat(result_dfs, ignore_index=True)
-    merged_df.to_excel('C:\\Users\\singh_kislay\\Desktop\\' + cluster + ' Call Details.xlsx', index=False)
-# endregion
+
+    merged_df = pd.concat([df for df in result_dfs if df is not None and not df.empty], ignore_index=True)
+    merged_df.to_excel(rf"C:\Users\singh_kislay\Desktop\{cluster} Call Details.xlsx", index=False)

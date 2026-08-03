@@ -10,6 +10,14 @@ import Billing.Processes.Server_Connections as sc
 import Billing.Billing_Unfreeze_Data as bud
 import Billing.Processes.Send_Email as se
 
+# region Code
+def write_sheet(wb, sheet_name, df, row):
+    ws = wb.sheets(sheet_name)
+    if not df.empty:
+        ws.cells(row, 1).options(index=False, header=False).value = df
+    else:
+        ws.visible = False
+
 def main(start_date, end_date, send_email, table='cad_raw_data', generate_file='yes', overlap_unfreeze='yes'):
     if sc.get_status() == 'Idle':
         sql_engine = None
@@ -22,6 +30,8 @@ def main(start_date, end_date, send_email, table='cad_raw_data', generate_file='
             sc.set_status('Busy')
             print("Billing Data Analysis Started at :", time.strftime("%H:%M:%S", time.localtime()))
             sql_engine = create_engine(sc.connection(16))
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
 
             # UAD CPED
             uad_cped_query = f'''
@@ -29,7 +39,7 @@ def main(start_date, end_date, send_email, table='cad_raw_data', generate_file='
                 from [Billing108].[dbo].[cad_raw_data] crd
                 inner join [Billing108].[dbo].exceptional_cases('{start_date} 00:00:00', '{end_date} 23:59:59') ec on crd.incident_id=ec.[Incident Id]
                 where crd.ambulance_assignment_time between '{start_date} 00:00:00' and '{end_date} 23:59:59'
-                and ec.[Standard Remarks] in ('UAD Case','Escalated Case (Case Overlap)');
+                and ec.[Standard Remarks] = 'UAD Case';
             '''
             uad_cped_df = pd.read_sql(uad_cped_query, con=sql_engine)
             if not uad_cped_df.empty:
@@ -38,33 +48,27 @@ def main(start_date, end_date, send_email, table='cad_raw_data', generate_file='
             # Run Analysis Procedure
             con_df = sc.connection(16, 'run', 'Billing108')
             conn = pyodbc.connect(f'DRIVER={{ODBC Driver 13 for SQL Server}};SERVER={con_df[2]};DATABASE={con_df[3]};UID={con_df[0]};PWD={con_df[1]}')
-            sp_query = f'''
-                exec Billing108.dbo.Billing_Data_Analysis 
-                '{datetime.strptime(start_date, '%Y-%m-%d').date()}', '{datetime.strptime(end_date, '%Y-%m-%d').date()}',
-                'Manual', '{table}';
-            '''
+            sp_query = f''' exec Billing108.dbo.Billing_Data_Analysis '{start_date}', '{end_date}', 'Manual', '{table}'; '''
             cursor = conn.cursor()
             cursor.execute(sp_query)
 
-            filepath = ''
+            analysis_filepath = ''
             if generate_file.lower() == 'yes':
-                source = fr'C:\Users\{sc.username}\Documents\GitHub\GVK-EMRI\108 Billing Process\Templates\108 Data Analysis.xlsb'
-                filepath = fr'C:\Users\{sc.username}\Desktop\108 Data Analysis ' + str(datetime.strptime(start_date, '%Y-%m-%d').day) \
-                           + ' to ' + str(datetime.strptime(end_date, '%Y-%m-%d').day) + ' ' \
-                           + str(datetime.strptime(end_date, '%Y-%m-%d').strftime('%b')) + ' - ' + str(datetime.now().day) \
-                           + ' ' + str(datetime.now().strftime('%b')) + ' ' + str(time.strftime("%I.%M %p")) + '.xlsb'
-                shutil.copyfile(source, filepath)
-
-                # wb = xw.Book(filepath)     # this can be used instead of the below 2 statements
-                app = xw.App(visible=True)
-                wb = app.books.open(filepath)
-
-                def write_sheet(sheet_name, df, row):
-                    ws = wb.sheets(sheet_name)
-                    if not df.empty:
-                        ws.cells(row, 1).options(index=False, header=False).value = df
+                username = sc.username()
+                template = fr'C:\Users\{username}\Documents\GitHub\GVK-EMRI\108 Billing Process\Templates\108 Data Analysis.xlsb'
+                if start_date == end_date:
+                    period = f"{start_date.day} {start_date:%b}"
+                else:
+                    if start_date.month == end_date.month:
+                        period = f"{start_date.day} to {end_date.day} {end_date:%b}"
                     else:
-                        ws.visible = False
+                        period = f"{start_date.day} {start_date:%b} to {end_date.day} {end_date:%b}"
+                analysis_filepath = fr'C:\Users\{username}\Desktop\108 Data Analysis {period} - {datetime.now().day} {datetime.now():%b %I.%M %p}.xlsb'
+                shutil.copyfile(template, analysis_filepath)
+
+                # wb = xw.Book(analysis_filepath)     # this can be used instead of the below 2 statements
+                app = xw.App(visible=True)
+                wb = app.books.open(analysis_filepath)
 
                 # Anomaly Data
                 anomaly_rows = []
@@ -73,7 +77,7 @@ def main(start_date, end_date, send_email, table='cad_raw_data', generate_file='
                             'is mci': rec[4], 'Source of Distance': rec[5], 'Case Type': rec[6], 'Map Distance': rec[7],
                             'Update From': rec[8], 'Call End': rec[9], 'Scope': rec[10], 'Standard Remarks': rec[11]})
                 anomaly = pd.DataFrame(anomaly_rows)
-                write_sheet('Data', anomaly, 2)
+                write_sheet(wb, 'Data', anomaly, 2)
 
                 # Case Overlap
                 if cursor.nextset():
@@ -82,7 +86,7 @@ def main(start_date, end_date, send_email, table='cad_raw_data', generate_file='
                         case_overlap_rows.append({'Overlapping ID': rec[0], 'Overlapping AT': rec[1], 'Overlapping BRT': rec[2], 'update_from': rec[3],
                                 'Standard Remarks': rec[4], 'Overlapped ID': rec[5], 'Overlapped AT': rec[6], 'Overlapped BRT': rec[7]})
                     case_overlap = pd.DataFrame(case_overlap_rows)
-                    write_sheet('Case Overlap', case_overlap, 3)
+                    write_sheet(wb, 'Case Overlap', case_overlap, 3)
                     if not case_overlap.empty and overlap_unfreeze == 'yes':
                         bud.main('Overlapping', ','.join(map(str, case_overlap['Overlapping ID'].astype('int64').tolist())))
 
@@ -94,20 +98,20 @@ def main(start_date, end_date, send_email, table='cad_raw_data', generate_file='
                                 'Ambulance_base_reach_time': rec[4], 'update_from': rec[5], 'Standard Remarks': rec[6],
                                 'ID': rec[7], 'Start Date': rec[8], 'End Date': rec[9]})
                     vip_overlap = pd.DataFrame(vip_overlap_rows)
-                    write_sheet('VIP Duty Overlap', vip_overlap, 3)
+                    write_sheet(wb, 'VIP Duty Overlap', vip_overlap, 3)
 
                 # Vehicle Offroad Case Overlap
                 if cursor.nextset():
                     offroad_overlap_rows = []
                     for rec in cursor:
                         offroad_overlap_rows.append({'incident_id': rec[0], 'vehicle_number': rec[1], 'ambulance_assignment_time': rec[2],
-                                                     'Ambulance_base_reach_time': rec[3], 'Standard Remarks': rec[4], 'off_road_time': rec[5],
-                                                     'on_road_time': rec[6]})
+                                                     'Ambulance_base_reach_time': rec[3], 'update_from': rec[4], 'Standard Remarks': rec[5],
+                                                     'off_road_time': rec[6], 'on_road_time': rec[7]})
                     offroad_overlap = pd.DataFrame(offroad_overlap_rows)
-                    write_sheet('Vehicle Offroad Case Overlap', offroad_overlap, 3)
+                    write_sheet(wb, 'Vehicle Offroad Case Overlap', offroad_overlap, 3)
 
                 wb.sheets['Summary'].activate()
-                wb.save(filepath)
+                wb.save(analysis_filepath)
             cursor.commit()
 
             # Beneficiary Contact Number
@@ -133,7 +137,7 @@ def main(start_date, end_date, send_email, table='cad_raw_data', generate_file='
                 bcn_all_df = pd.read_sql(bcn_all_query, con=mysql_engine)
                 upload_bcn_df = pd.merge(bcn_df, bcn_all_df, on='IncidentID', how='left', indicator=True)
                 upload_bcn_df = upload_bcn_df[upload_bcn_df['_merge'] == 'left_only'].reset_index(drop=True)
-                contacts_cases = upload_bcn_df.shape[0]
+                contacts_cases = len(upload_bcn_df)
                 if contacts_cases > 0:
                     print('Benef. Contact No. in more than 2 Districts:', contacts_cases)
                     upload_bcn_df = upload_bcn_df[['Cluster', 'IncidentID', 'Ambulance_Assignment_Time']]
@@ -141,17 +145,17 @@ def main(start_date, end_date, send_email, table='cad_raw_data', generate_file='
 
             # Send Email
             if generate_file.lower() == 'yes' and send_email.lower() == 'yes':
-                filename = Path(filepath).stem
+                analysis_filename = Path(analysis_filepath).stem
                 email_body = '''Dear Sir,
-        
+
 Please find attached file containing 108 Data Analysis. UAD cases may not be excluded from Analysis.
 
 Regards,
 Kislay Kumar Singh
 IS Department
                 '''
-                se.send_mail(['vishal_jayaswal@emri.in', 'kvishesh_bahadur@emri.in'], filename, email_body,
-                             ['sanjay_yadav@emri.in', 'up_cped@emri.in'], filepath, filename)
+                se.send_mail(['vishal_jayaswal@emri.in', 'kvishesh_bahadur@emri.in'], analysis_filename, email_body,
+                             ['sanjay_yadav@emri.in', 'up_cped@emri.in'], analysis_filepath, analysis_filename)
 
             print("Billing Data Analysis Completed at :", time.strftime("%H:%M:%S", time.localtime()))
             return True
@@ -166,16 +170,21 @@ IS Department
                 cursor.close()
             if conn:
                 conn.close()
-            if wb:
-                wb.close()
-            if app:
-                app.quit()
+            try:
+                if wb:
+                    wb.close()
+            except Exception:
+                pass
+            try:
+                if app:
+                    app.quit()
+            except Exception:
+                pass
             if mysql_engine:
                 mysql_engine.dispose()
     else:
         return sc.running_status()
+# endregion
 
 if __name__ == "__main__":
-    start_date = '2026-05-20'
-    end_date = '2026-05-20'
-    main(start_date, end_date, 'Yes')
+    main('2026-07-31', '2026-07-31', 'No')
